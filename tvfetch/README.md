@@ -3,7 +3,7 @@
 A simple, fastfetch-like program to display stats about your TV.
 
 # An example 
-
+ 
 ```
                       .==.                          root@Samsung
                    ..====.                          ------------
