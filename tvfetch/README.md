@@ -10,7 +10,7 @@ A simple, fastfetch-like program to display stats about your TV.
                 ..+++++==.                          OS: Tizen 6.0.0 (Tizen6/TV)
                 +++++++++.                          Kernel: 4.1.10
                ++++++++++.                          Uptime: 4h 8m
-              .**++++++++.                          Shell: /bin/bash (GNU bash, version 3.2.57(1)-release (armv7l-tizen-linux-gnueabi))
+              .**++++++++.                          Shell: /bin/bash (GNU bash, version 3.2.57(1)-release)
               @#***++++++.@@@@@@@@@@***++++.        WM: Enlightenment
              .@%#*****+. ########%****+++++++.      CPU: Novatek NT72671D (Novatek-Cortex CA53) (4)
              @%%##**-    %%######****+++++++++==.   GPU: Mali-G52 (1 core, r1p0)
