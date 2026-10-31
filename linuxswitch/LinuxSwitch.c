@@ -13,6 +13,7 @@
  * Usage (as root on the TV):
  *   LinuxSwitch                         USB stick: unshackle.squashfs, or unshackle.url
  *   LinuxSwitch --url http://h:8000/unshackle.squashfs
+ *   LinuxSwitch --scan                  find a server on the LAN (:8000/unshackle.squashfs) and pick it
  *   LinuxSwitch --download-only --url ... --cache /tmp/mnt   (stage the image, then exit)
  *   LinuxSwitch --teardown [--reboot]   undo mounts/processes without rebooting
  *   LinuxSwitch --help
@@ -43,9 +44,14 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -92,7 +98,7 @@ static struct {
     const char *logdir;       /* --logdir */
     const char *extra[16];    /* --kill */
     int n_extra;
-    int prefer_net, kill_streaming, no_reboot, download_only, menu, unsafe_paths;
+    int prefer_net, kill_streaming, no_reboot, download_only, menu, unsafe_paths, scan;
     int teardown, reboot_after;
     long min_mem;             /* MB */
     int wait_sec;             /* -1 = auto */
@@ -1053,6 +1059,8 @@ static void usage(void)
 {
     puts("LinuxSwitch " VERSION " - UnshackleOS root switcher\n\n"
          "  --url URL          fetch the image over http:// instead of the USB stick\n"
+         "  --scan             scan the local network for a server answering\n"
+         "                     :8000/unshackle.squashfs and pick one (also in --menu)\n"
          "  --sha256 HEX       expected SHA-256 of the image (else <url>.sha256 is tried)\n"
          "  --cache DIR        where to store a downloaded image (default: USB stick, else RAM)\n"
          "  --prefer-net       use unshackle.url from the stick even if a local image exists\n"
@@ -1083,6 +1091,257 @@ static int http_ok(const char *url)
     return st == 200;
 }
 
+
+/* ------------------------------------------------------------ LAN discovery */
+
+#define SCAN_PORT      8000
+#define SCAN_MAX       16
+#define SCAN_CONN_MS   800     /* time allowed for a whole batch of TCP connects */
+#define SCAN_BATCH     128
+
+typedef struct { char url[96]; long long size; } found_t;
+
+/* HEAD /unshackle.squashfs on an already-connected socket.
+ * Returns the Content-Length when the server really has the image, else -1. */
+static long long probe_image(int fd, const char *ip)
+{
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 500000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int fl = fcntl(fd, F_GETFL);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+
+    char req[256];
+    int n = snprintf(req, sizeof req,
+                     "HEAD /" IMGNAME " HTTP/1.1\r\nHost: %s:%d\r\n"
+                     "User-Agent: LinuxSwitch/" VERSION "\r\nConnection: close\r\n\r\n",
+                     ip, SCAN_PORT);
+    if (send_all(fd, req, (size_t)n) != 0) return -1;
+
+    char buf[2048];
+    size_t len = 0;
+    buf[0] = 0;
+    while (len < sizeof buf - 1) {
+        ssize_t k = recv(fd, buf + len, sizeof buf - 1 - len, 0);
+        if (k <= 0) break;
+        len += (size_t)k;
+        buf[len] = 0;
+        if (strstr(buf, "\r\n\r\n")) break;
+    }
+    int st = 0;
+    if (sscanf(buf, "HTTP/%*s %d", &st) != 1 || st != 200) return -1;
+    const char *p = strcasestr(buf, "\r\nContent-Length:");
+    long long clen = p ? atoll(p + 17) : 0;
+    return clen >= MB ? clen : -1;        /* a real OS image is not tiny */
+}
+
+static long ms_since(const struct timespec *t0)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (t.tv_sec - t0->tv_sec) * 1000L + (t.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
+static void scan_range(uint32_t net, uint32_t bcast, uint32_t self,
+                       found_t *out, int *nf, int max)
+{
+    for (uint32_t base = net + 1; base < bcast && *nf < max; base += SCAN_BATCH) {
+        struct pollfd pf[SCAN_BATCH];
+        uint32_t addr[SCAN_BATCH];
+        char hit[SCAN_BATCH];
+        int n = 0;
+
+        /* fire off a batch of non-blocking connects in parallel */
+        for (uint32_t a = base; a < base + SCAN_BATCH && a < bcast; a++) {
+            if (a == self) continue;
+            int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (fd < 0) continue;
+            struct sockaddr_in sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sin_family = AF_INET;
+            sa.sin_port = htons(SCAN_PORT);
+            sa.sin_addr.s_addr = htonl(a);
+            if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0 && errno != EINPROGRESS) {
+                close(fd);
+                continue;
+            }
+            pf[n].fd = fd; pf[n].events = POLLOUT; pf[n].revents = 0;
+            addr[n] = a; hit[n] = 0;
+            n++;
+        }
+
+        /* collect results until everyone answered or the batch deadline hits */
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int pending = n;
+        while (pending > 0) {
+            long left = SCAN_CONN_MS - ms_since(&t0);
+            if (left <= 0) break;
+            int pr = poll(pf, (nfds_t)n, (int)left);
+            if (pr < 0 && errno == EINTR) continue;
+            if (pr <= 0) break;
+            for (int i = 0; i < n; i++) {
+                if (pf[i].fd < 0 || !pf[i].revents) continue;
+                int err = 0; socklen_t l = sizeof err;
+                getsockopt(pf[i].fd, SOL_SOCKET, SO_ERROR, &err, &l);
+                if (!err && (pf[i].revents & POLLOUT) && !(pf[i].revents & (POLLERR | POLLHUP))) {
+                    hit[i] = 1;                 /* keep the fd open for probing */
+                } else {
+                    close(pf[i].fd);
+                    pf[i].fd = -1;
+                }
+                pf[i].events = 0;               /* done with this one */
+                pf[i].revents = 0;
+                pending--;
+            }
+        }
+
+        /* probe only the hosts that accepted the TCP connection */
+        for (int i = 0; i < n; i++) {
+            if (pf[i].fd < 0) continue;
+            if (hit[i] && *nf < max) {
+                struct in_addr ia;
+                ia.s_addr = htonl(addr[i]);
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &ia, ip, sizeof ip);
+                long long sz = probe_image(pf[i].fd, ip);
+                if (sz >= 0) {
+                    snprintf(out[*nf].url, sizeof out[*nf].url,
+                             "http://%s:%d/" IMGNAME, ip, SCAN_PORT);
+                    out[*nf].size = sz;
+                    (*nf)++;
+                }
+            }
+            close(pf[i].fd);
+        }
+    }
+}
+
+/* Scan every up, non-loopback IPv4 subnet (capped at /22 around our own address). */
+static int scan_net(found_t *out, int max)
+{
+    struct ifaddrs *ifs, *ia;
+    if (getifaddrs(&ifs) != 0) { say("getifaddrs failed: %s", strerror(errno)); return 0; }
+    int nf = 0;
+    uint32_t seen_net[8];
+    int n_seen = 0;
+
+    for (ia = ifs; ia && nf < max; ia = ia->ifa_next) {
+        if (!ia->ifa_addr || !ia->ifa_netmask || ia->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ia->ifa_flags & IFF_UP) || (ia->ifa_flags & IFF_LOOPBACK)) continue;
+        uint32_t ip   = ntohl(((struct sockaddr_in *)ia->ifa_addr)->sin_addr.s_addr);
+        uint32_t mask = ntohl(((struct sockaddr_in *)ia->ifa_netmask)->sin_addr.s_addr);
+        if (mask >= 0xFFFFFFFEu) continue;                 /* /31, /32: nothing to scan */
+        if (mask < 0xFFFFFC00u) mask = 0xFFFFFC00u;        /* never more than 1022 hosts */
+        uint32_t net = ip & mask, bcast = net | ~mask;
+
+        int dup = 0;
+        for (int i = 0; i < n_seen; i++) if (seen_net[i] == net) dup = 1;
+        if (dup) continue;
+        if (n_seen < 8) seen_net[n_seen++] = net;
+
+        struct in_addr na; na.s_addr = htonl(ip);
+        char s[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &na, s, sizeof s);
+        say("scanning %s (%s) for :%d/" IMGNAME, ia->ifa_name, s, SCAN_PORT);
+        scan_range(net, bcast, ip, out, &nf, max);
+    }
+    freeifaddrs(ifs);
+    return nf;
+}
+
+/* Scan, list, let the person pick. Returns 1 and fills out[] on success. */
+static int pick_server(char *out, size_t sz)
+{
+    int tty = isatty(0);
+    for (;;) {
+        found_t f[SCAN_MAX];
+        printf("Scanning local network for :%d/" IMGNAME " ...\n", SCAN_PORT);
+        fflush(stdout);
+        int n = scan_net(f, SCAN_MAX);
+        if (n == 0) {
+            printf("No server on this network answered with %s on port %d.\n"
+                   "(Is the server running on the PC, and is the TV on the same network?)\n",
+                   IMGNAME, SCAN_PORT);
+            if (!tty) return 0;
+            printf("[r] rescan  [anything else] cancel > ");
+            fflush(stdout);
+            char ln[64];
+            if (!fgets(ln, sizeof ln, stdin) || (ln[0] != 'r' && ln[0] != 'R')) return 0;
+            continue;
+        }
+        for (int i = 0; i < n; i++)
+            printf("  %d) %s  (%lld MB)\n", i + 1, f[i].url, f[i].size / MB);
+        int pick = 0;
+        if (!tty) pick = 0;                       /* non-interactive: first hit */
+        else {
+            printf("Choose 1-%d [Enter = 1], r = rescan, 0 = cancel > ", n);
+            fflush(stdout);
+            char ln[64];
+            if (!fgets(ln, sizeof ln, stdin)) return 0;
+            trim(ln);
+            if (ln[0] == 'r' || ln[0] == 'R') continue;
+            if (ln[0] == 0) pick = 0;
+            else {
+                int v = atoi(ln);
+                if (v == 0) return 0;
+                if (v < 1 || v > n) { printf("Not a valid choice.\n"); continue; }
+                pick = v - 1;
+            }
+        }
+        snprintf(out, sz, "%s", f[pick].url);
+        return 1;
+    }
+}
+
+/* Make typed input forgiving:
+ *   192.168.1.10                 -> http://192.168.1.10:8000/unshackle.squashfs
+ *   192.168.1.10:8000            -> http://192.168.1.10:8000/unshackle.squashfs
+ *   http://host:8000/            -> http://host:8000/unshackle.squashfs
+ *   http://host:8000/dir/        -> http://host:8000/dir/unshackle.squashfs
+ * A full URL with a file name is left alone. */
+static void normalize_url(char *dst, size_t sz, const char *in)
+{
+    char t[2048];
+    snprintf(t, sizeof t, "%s", in);
+    trim(t);
+    if (!strstr(t, "://")) {
+        char u[2048];
+        snprintf(u, sizeof u, "http://%s", t);
+        snprintf(t, sizeof t, "%s", u);
+    }
+    const char *auth = strstr(t, "://") + 3;
+    const char *slash = strchr(auth, '/');
+    int has_port = 0;
+    {
+        size_t alen = slash ? (size_t)(slash - auth) : strlen(auth);
+        for (size_t i = 0; i < alen; i++) if (auth[i] == ':') has_port = 1;
+    }
+    char out[2200];
+    if (!slash) {
+        snprintf(out, sizeof out, "%s%s/" IMGNAME, t, has_port ? "" : ":" "8000");
+    } else if (slash[strlen(slash) - 1] == '/') {
+        snprintf(out, sizeof out, "%s" IMGNAME, t);
+    } else {
+        snprintf(out, sizeof out, "%s", t);
+    }
+    snprintf(dst, sz, "%s", out);
+}
+
+/* Is there really a file behind this URL? (HEAD, falling back to GET.)
+ * Checked BEFORE Tizen's UI is stopped, so a typo can never take the TV down. */
+static int url_has_image(const char *url)
+{
+    static resp_t rs;
+    int st = http_request(url, "HEAD", 0, &rs);
+    if (st >= 0) close(rs.r.fd);
+    if (st == 405 || st == 501) {
+        st = http_request(url, "GET", 0, &rs);
+        if (st >= 0) close(rs.r.fd);
+    }
+    return st == 200;
+}
+
 static int run(void)
 {
     char image[700] = "";
@@ -1110,10 +1369,21 @@ static int run(void)
 
     /* interactive picker: forced by --menu, or when nothing was found on a terminal */
     static char menu_url[2048];
+    if (O.scan && !O.url) {
+        if (pick_server(menu_url, sizeof menu_url)) {
+            O.url = menu_url;
+            snprintf(url, sizeof url, "%s", menu_url);
+        } else {
+            say("no server picked: leaving Tizen untouched");
+            if (g_usb_mounted) umount(USBDIR);
+            return 1;
+        }
+    }
     if (!O.url && isatty(0) && (O.menu || (!local && !has_urlfile))) {
         for (;;) {
             char ln[2300];
-            printf("\n== LinuxSwitch ==\n  1) USB stick%s\n  2) Network (http:// URL)\n  3) Quit\n> ",
+            printf("\n== LinuxSwitch ==\n  1) USB stick%s\n  2) Network: auto-scan for a server\n"
+                   "  3) Network: type an address / URL\n  4) Quit\n> ",
                    local ? " (image found)" : "");
             fflush(stdout);
             if (!fgets(ln, sizeof ln, stdin)) { if (g_usb_mounted) umount(USBDIR); return 0; }
@@ -1130,15 +1400,28 @@ static int run(void)
                 if (local || has_urlfile) break;
                 printf("No unshackle.squashfs / unshackle.url on a stick. Insert one and retry.\n");
             } else if (ln[0] == '2') {
-                printf("URL (e.g. http://192.168.1.10:8000/unshackle.squashfs): ");
-                fflush(stdout);
-                if (!fgets(menu_url, sizeof menu_url, stdin)) continue;
-                trim(menu_url);
-                if (strncasecmp(menu_url, "http://", 7)) { printf("Must start with http:// (no TLS in this build).\n"); continue; }
+                if (!pick_server(menu_url, sizeof menu_url)) continue;
                 O.url = menu_url;
                 snprintf(url, sizeof url, "%s", menu_url);
                 break;
-            } else if (ln[0] == '3' || ln[0] == 'q' || ln[0] == 'Q') {
+            } else if (ln[0] == '3') {
+                printf("Address or URL (e.g. 192.168.1.10 or http://192.168.1.10:8000/unshackle.squashfs): ");
+                fflush(stdout);
+                char typed[2048];
+                if (!fgets(typed, sizeof typed, stdin)) continue;
+                trim(typed);
+                if (!typed[0]) continue;
+                if (!strncasecmp(typed, "https://", 8)) { printf("https:// is not supported (no TLS in this build). Use http://\n"); continue; }
+                normalize_url(menu_url, sizeof menu_url, typed);
+                printf("Checking %s ...\n", menu_url);
+                if (!url_has_image(menu_url)) {
+                    printf("Nothing to download there (wrong port or path, or server not running). Try again.\n");
+                    continue;
+                }
+                O.url = menu_url;
+                snprintf(url, sizeof url, "%s", menu_url);
+                break;
+            } else if (ln[0] == '4' || ln[0] == 'q' || ln[0] == 'Q') {
                 if (g_usb_mounted) umount(USBDIR);
                 return 0;
             }
@@ -1195,6 +1478,13 @@ static int run(void)
             return 1;
         }
         say("network image: %s (cache: %s%s)", url, dir, ram ? ", RAM" : "");
+
+        /* preflight: make sure the file exists BEFORE Tizen's UI gets stopped */
+        if (!url_has_image(url)) {
+            say("%s is not reachable / has no image (wrong port or path?): leaving Tizen untouched", url);
+            if (g_usb_mounted) umount(USBDIR);
+            return 1;
+        }
 
         if (O.sha) snprintf(sha_text, sizeof sha_text, "%s", O.sha);
         else {
@@ -1289,7 +1579,7 @@ int main(int argc, char **argv)
         {"smack", 1, 0, 'S'}, {"logdir", 1, 0, 'l'}, {"kill", 1, 0, 'k'}, {"min-mem", 1, 0, 'm'},
         {"wait", 1, 0, 'w'}, {"timeout", 1, 0, 't'}, {"prefer-net", 0, 0, 'p'},
         {"kill-streaming", 0, 0, 'K'}, {"no-reboot", 0, 0, 'n'}, {"download-only", 0, 0, 'd'},
-        {"menu", 0, 0, 'M'}, {"unsafe-paths", 0, 0, 'U'}, {"teardown", 0, 0, 'T'}, {"reboot", 0, 0, 'R'}, {"help", 0, 0, 'h'}, {0, 0, 0, 0}
+        {"menu", 0, 0, 'M'}, {"scan", 0, 0, 'N'}, {"unsafe-paths", 0, 0, 'U'}, {"teardown", 0, 0, 'T'}, {"reboot", 0, 0, 'R'}, {"help", 0, 0, 'h'}, {0, 0, 0, 0}
     };
     int c;
     while ((c = getopt_long(argc, argv, "h", lo, NULL)) != -1) {
@@ -1309,6 +1599,7 @@ int main(int argc, char **argv)
         case 'n': O.no_reboot = 1; break;
         case 'd': O.download_only = 1; break;
         case 'M': O.menu = 1; break;
+        case 'N': O.scan = 1; break;
         case 'U': O.unsafe_paths = 1; break;
         case 'T': O.teardown = 1; break;
         case 'R': O.reboot_after = 1; break;
