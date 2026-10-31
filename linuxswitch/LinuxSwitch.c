@@ -23,6 +23,11 @@
  *   3. unshackle.url on stick        (first line = http:// URL)
  *   --prefer-net swaps 2 and 3.
  *
+ * Storage safety: LinuxSwitch never opens mmcblk or mtd nodes, only mounts USB-backed
+ * sd devices (verified through sysfs), only writes to tmpfs or the USB stick, and hides
+ * every non-USB block device and mtd node from the chroot. This guards against accidents
+ * (dd, mkfs, automounters); it is not a sandbox against a deliberately hostile root.
+ *
  * Network notes: the TV kernel only has squashfs/vfat/msdos/fuse/vdfs, so there
  * is no NFS/CIFS/NBD. The image is therefore downloaded (resumable, Range
  * requests) to a cache file and loop-mounted from there. Cache location:
@@ -57,6 +62,8 @@
 #include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
+#include <sys/vfs.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -85,7 +92,7 @@ static struct {
     const char *logdir;       /* --logdir */
     const char *extra[16];    /* --kill */
     int n_extra;
-    int prefer_net, kill_streaming, no_reboot, download_only, menu;
+    int prefer_net, kill_streaming, no_reboot, download_only, menu, unsafe_paths;
     int teardown, reboot_after;
     long min_mem;             /* MB */
     int wait_sec;             /* -1 = auto */
@@ -640,6 +647,73 @@ static int fetch_image(const char *url, const char *dir, const char *expect_sha,
 static int g_usb_mounted, g_usb_rw;
 static char g_usb_dev[64];
 
+/* ---- eMMC safety helpers ------------------------------------------------ */
+
+#define TMPFS_MAGIC_ 0x01021994
+
+/* True if writing to `path` is allowed: it must live on tmpfs, or inside the
+ * mounted USB stick. Works for paths that do not exist yet (checks the nearest
+ * existing parent), so nothing is created on an unsafe filesystem first. */
+static int write_ok(const char *path)
+{
+    if (O.unsafe_paths) return 1;
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s", path);
+    for (;;) {
+        char real[PATH_MAX];
+        if (realpath(p, real)) {
+            size_t ul = strlen(USBDIR);
+            if (!strncmp(real, USBDIR, ul) && (real[ul] == '/' || real[ul] == 0))
+                return g_usb_mounted;
+            struct statfs sf;
+            return statfs(real, &sf) == 0 && (unsigned long)sf.f_type == TMPFS_MAGIC_;
+        }
+        char *sl = strrchr(p, '/');
+        if (!sl) return 0;
+        if (sl == p) { if (p[1] == 0) return 0; p[1] = 0; continue; }
+        *sl = 0;
+    }
+}
+
+/* True only if block device `name` (e.g. "sda1") hangs off a USB bus. */
+static int usb_backed(const char *name)
+{
+    char p[128], real[PATH_MAX];
+    snprintf(p, sizeof p, "/sys/class/block/%s", name);
+    if (!realpath(p, real)) return 0;
+    return strstr(real, "/usb") != NULL;
+}
+
+/* Hide every block device except USB sd* (and every mtd node) from the chroot by
+ * bind-mounting /dev/null over it. Must run after NR/dev is made private, or the
+ * masks would propagate back to Tizen's real /dev. */
+static int mask_devices(void)
+{
+    DIR *d = opendir(NR "/dev");
+    if (!d) { say("cannot open %s/dev: %s", NR, strerror(errno)); return -1; }
+    struct dirent *e;
+    int masked = 0, rc = 0;
+    while ((e = readdir(d))) {
+        char path[300];
+        struct stat st;
+        snprintf(path, sizeof path, NR "/dev/%s", e->d_name);
+        if (lstat(path, &st) != 0) continue;
+        int hide = 0;
+        if (S_ISBLK(st.st_mode))
+            hide = !(!strncmp(e->d_name, "sd", 2) && usb_backed(e->d_name));
+        else if (S_ISCHR(st.st_mode) && !strncmp(e->d_name, "mtd", 3))
+            hide = 1;
+        if (!hide) continue;
+        if (mount("/dev/null", path, NULL, MS_BIND, NULL) != 0) {
+            say("FAILED to mask %s: %s", path, strerror(errno));
+            rc = -1;
+        } else masked++;
+    }
+    closedir(d);
+    say("storage safety: masked %d block/mtd device node(s) in the chroot", masked);
+    return rc;
+}
+
 static int usb_try(const char *dev)
 {
     if (mount(dev, USBDIR, "vfat", MS_RDONLY, NULL) != 0) return 0;
@@ -657,10 +731,13 @@ static int find_usb(int wait_sec)
     for (int t = 0; t <= wait_sec; t++) {
         for (char c = 'a'; c <= 'z'; c++) {
             char dev[32];
-            snprintf(dev, sizeof dev, "/dev/sd%c1", c);
-            if (exists(dev) && usb_try(dev)) return 1;
-            snprintf(dev, sizeof dev, "/dev/sd%c", c);
-            if (exists(dev) && usb_try(dev)) return 1;
+            char nm[8];
+            snprintf(nm, sizeof nm, "sd%c1", c);
+            snprintf(dev, sizeof dev, "/dev/%s", nm);
+            if (exists(dev) && usb_backed(nm) && usb_try(dev)) return 1;
+            snprintf(nm, sizeof nm, "sd%c", c);
+            snprintf(dev, sizeof dev, "/dev/%s", nm);
+            if (exists(dev) && usb_backed(nm) && usb_try(dev)) return 1;
         }
         if (t < wait_sec) sleep(1);
     }
@@ -826,7 +903,12 @@ static int mount_layout(const char *img)
     if (do_mount("proc", NR "/proc", "proc", 0, NULL)) return -1;
     if (do_mount("/sys", NR "/sys", NULL, MS_BIND | MS_REC, NULL)) return -1;
     if (do_mount("/dev", NR "/dev", NULL, MS_BIND | MS_REC, NULL)) return -1;
-    if (do_mount("/run", NR "/run", NULL, MS_BIND, NULL)) return -1;
+    /* keep our device masks from propagating back to Tizen's real /dev */
+    if (do_mount(NULL, NR "/dev", NULL, MS_PRIVATE | MS_REC, NULL)) return -1;
+    if (mask_devices() != 0) return -1;
+    /* --rbind, not --bind: /run/user/5001 is its own tmpfs mount and a plain bind
+     * would hide it (and enlightenment's Wayland socket) */
+    if (do_mount("/run", NR "/run", NULL, MS_BIND | MS_REC, NULL)) return -1;
     if (do_mount("/", NR "/host", NULL, MS_BIND, NULL)) return -1;
     if (do_mount(NULL, NR "/host", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL)) return -1;
     return 0;
@@ -940,7 +1022,8 @@ static void save_logs(void)
 {
     const char *dst = NULL;
     if (g_usb_mounted && usb_make_rw() == 0) dst = USBDIR;
-    else if (O.logdir) { mkdir_p(O.logdir, 0755); dst = O.logdir; }
+    else if (O.logdir && write_ok(O.logdir)) { mkdir_p(O.logdir, 0755); dst = O.logdir; }
+    else if (O.logdir) say("refusing --logdir %s: not tmpfs or the USB stick", O.logdir);
     if (!dst) { say("no writable place for logs; they remain in %s until reboot", W); return; }
     static const char *const files[] = {
         W "/switcher.log", W "/session.log", W "/host-agent.log",
@@ -985,6 +1068,8 @@ static void usage(void)
          "  --smack LABEL      write LABEL to /proc/self/attr/current before chroot\n"
          "  --logdir DIR       save failure logs here when there is no writable stick\n"
          "  --no-reboot        never reboot on failure (for debugging)\n"
+         "  --unsafe-paths     allow --cache/--logdir outside tmpfs and the USB stick (NOT recommended:\n"
+         "                     keeps LinuxSwitch away from eMMC by default)\n"
          "  --teardown         stop the session and unmount everything\n"
          "  --reboot           with --teardown: reboot afterwards");
 }
@@ -1103,6 +1188,12 @@ static int run(void)
         if (O.cache) dir = O.cache;
         else if (g_usb_mounted && usb_make_rw() == 0) dir = USBDIR;
         else { dir = NETDIR; ram = 1; }
+        if (!write_ok(dir)) {
+            say("refusing to write to %s: not tmpfs or the USB stick (eMMC protection). "
+                "Use a USB stick, or --unsafe-paths if you really mean it.", dir);
+            if (g_usb_mounted) umount(USBDIR);
+            return 1;
+        }
         say("network image: %s (cache: %s%s)", url, dir, ram ? ", RAM" : "");
 
         if (O.sha) snprintf(sha_text, sizeof sha_text, "%s", O.sha);
@@ -1198,7 +1289,7 @@ int main(int argc, char **argv)
         {"smack", 1, 0, 'S'}, {"logdir", 1, 0, 'l'}, {"kill", 1, 0, 'k'}, {"min-mem", 1, 0, 'm'},
         {"wait", 1, 0, 'w'}, {"timeout", 1, 0, 't'}, {"prefer-net", 0, 0, 'p'},
         {"kill-streaming", 0, 0, 'K'}, {"no-reboot", 0, 0, 'n'}, {"download-only", 0, 0, 'd'},
-        {"menu", 0, 0, 'M'}, {"teardown", 0, 0, 'T'}, {"reboot", 0, 0, 'R'}, {"help", 0, 0, 'h'}, {0, 0, 0, 0}
+        {"menu", 0, 0, 'M'}, {"unsafe-paths", 0, 0, 'U'}, {"teardown", 0, 0, 'T'}, {"reboot", 0, 0, 'R'}, {"help", 0, 0, 'h'}, {0, 0, 0, 0}
     };
     int c;
     while ((c = getopt_long(argc, argv, "h", lo, NULL)) != -1) {
@@ -1218,6 +1309,7 @@ int main(int argc, char **argv)
         case 'n': O.no_reboot = 1; break;
         case 'd': O.download_only = 1; break;
         case 'M': O.menu = 1; break;
+        case 'U': O.unsafe_paths = 1; break;
         case 'T': O.teardown = 1; break;
         case 'R': O.reboot_after = 1; break;
         default: usage(); return c == 'h' ? 0 : 2;
@@ -1225,6 +1317,11 @@ int main(int argc, char **argv)
     }
 
     signal(SIGPIPE, SIG_IGN);
+    if (!write_ok(W) || !write_ok(RUNDIR)) {
+        fprintf(stderr, "[LinuxSwitch] refusing to start: %s or %s is not on tmpfs, so "
+                "working there could touch eMMC. (--unsafe-paths overrides.)\n", W, RUNDIR);
+        return 1;
+    }
     mkdir_p(W, 0755);
     g_log = fopen(LOGFILE, "a");
     say("LinuxSwitch " VERSION " starting");
