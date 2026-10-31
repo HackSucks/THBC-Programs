@@ -1,0 +1,82 @@
+{
+    "schema": "tizen-hbc/catalog@1",
+    "name": "SamPwn Programs",
+    "updated": "2026-10-31",
+    "installRoot": "/opt/usr/home/hbc/programs",
+    "baseUrl": "",
+    "programs": [
+        {
+            "id": "tvfetch",
+            "name": "TVFetch",
+            "author": "HackSucks",
+            "version": "1.0.0",
+            "description": "A fastfetch-like system information viewer for Samsung Tizen TVs. Prints OS, kernel, uptime, CPU, GPU, memory, disk and network details with a Tux-style logo.",
+            "dir": "tvfetch",
+            "readme": "README.md",
+            "language": "csharp",
+            "runtime": "dotnet",
+            "entry": "tvfetch.dll",
+            "terminal": true,
+            "keyboard": false,
+            "icon": "res/icons/tvfetch.png",
+            "bundled": true,
+            "files": [
+                {
+                    "path": "tvfetch.dll",
+                    "url": "tvfetch/tvfetch.dll",
+                    "sha256": "618c514e9e7df4ad4e136f1b37c21ffee0fb3a18ca6d7d84d8c392281cd7831b",
+                    "size": 17408
+                },
+                {
+                    "path": "tvfetch.deps.json",
+                    "url": "tvfetch/tvfetch.deps.json",
+                    "sha256": "986c5c095329157bfaf4b03324ca8ea7142843fcab88f778fda499b3a5f0e407",
+                    "size": 447
+                },
+                {
+                    "path": "tvfetch.runtimeconfig.json",
+                    "url": "tvfetch/tvfetch.runtimeconfig.json",
+                    "sha256": "73b656f50d97f1d252c3ece1aa6cc9114f8a6fb4cc90e4a6731c0b947916d391",
+                    "size": 249
+                },
+                {
+                    "path": "README.md",
+                    "url": "tvfetch/README.md",
+                    "sha256": "4e48625acf3c6087c336c5c4d7d84a7cf1f3d5c91e19c901a63fd4c110c3cc5f",
+                    "size": 1910
+                }
+            ]
+        },
+        {
+            "id": "fastfetch",
+            "name": "Fastfetch",
+            "author": "fastfetch contributors",
+            "version": "2.70.0",
+            "description": "A feature-rich system information tool, running as a statically linked native ARM binary through the managed ELF loader.",
+            "dir": "fastfetch",
+            "readme": "README.md",
+            "language": "native",
+            "runtime": "elf",
+            "entry": "fastfetch",
+            "terminal": true,
+            "keyboard": false,
+            "icon": "res/icons/fastfetch.png",
+            "bundled": true,
+            "files": [
+                {
+                    "path": "fastfetch",
+                    "url": "fastfetch/fastfetch",
+                    "sha256": "9777433eb451cf8a93eeb31f4f93122b77514757c52c057b04eabf00ec1bc176",
+                    "size": 1936912,
+                    "executable": true
+                },
+                {
+                    "path": "README.md",
+                    "url": "fastfetch/README.md",
+                    "sha256": "d2e5e927ee81daad8cacdde922037100cd1ff2209f67aba295311f7e1e4d66ef",
+                    "size": 989
+                }
+            ]
+        }
+    ]
+}
