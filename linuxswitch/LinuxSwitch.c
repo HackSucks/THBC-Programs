@@ -970,6 +970,7 @@ static void teardown(void)
         if (fd >= 0) { ioctl(fd, LOOP_CLR_FD, 0); close(fd); }
     }
     umount2(USBDIR, MNT_DETACH);
+    umount2(NETDIR, MNT_DETACH);
     say("teardown finished");
 }
 
@@ -1030,7 +1031,8 @@ static void save_logs(void)
     if (g_usb_mounted && usb_make_rw() == 0) dst = USBDIR;
     else if (O.logdir && write_ok(O.logdir)) { mkdir_p(O.logdir, 0755); dst = O.logdir; }
     else if (O.logdir) say("refusing --logdir %s: not tmpfs or the USB stick", O.logdir);
-    if (!dst) { say("no writable place for logs; they remain in %s until reboot", W); return; }
+    if (!dst) { say("no writable place for logs (no USB stick); they remain in %s until reboot. "
+                       "Plug a stick in to keep them", W); return; }
     static const char *const files[] = {
         W "/switcher.log", W "/session.log", W "/host-agent.log",
         RUNDIR "/gfx-report.txt", RUNDIR "/fiwd.log", RUNDIR "/wl-globals.txt", RUNDIR "/stage", NULL
@@ -1050,6 +1052,10 @@ static void fail_and_restore(const char *why)
     say("FAILURE: %s", why);
     save_logs();
     if (O.no_reboot) { say("--no-reboot given, leaving system as is"); return; }
+    if (isatty(2)) {
+        say("rebooting in 20s: read the message above (Ctrl-C to stay and inspect %s)", LOGFILE);
+        sleep(20);
+    }
     sync_reboot();
 }
 
@@ -1342,6 +1348,17 @@ static int url_has_image(const char *url)
     return st == 200;
 }
 
+/* Content-Length of the image, or -1 if the server does not say. */
+static long long url_size(const char *url)
+{
+    static resp_t rs;
+    int st = http_request(url, "HEAD", 0, &rs);
+    if (st < 0) return -1;
+    long long n = (st == 200) ? rs.clen : -1;
+    close(rs.r.fd);
+    return n;
+}
+
 static int run(void)
 {
     char image[700] = "";
@@ -1486,6 +1503,34 @@ static int run(void)
             return 1;
         }
 
+        /* RAM cache: prove it can work BEFORE any Tizen process is stopped. A failure
+         * after free_ram() means a reboot, so every check that can be done early is. */
+        if (ram) {
+            long long total = url_size(url);
+            if (total <= 0) {
+                say("server did not report a size; a RAM download needs one. Use a USB stick: leaving Tizen untouched");
+                return 1;
+            }
+            /* a private tmpfs sized for the image, so /tmp's own size cap cannot bite */
+            mkdir_p(NETDIR, 0755);
+            char opt[64];
+            snprintf(opt, sizeof opt, "size=%lldm", total / MB + 64);
+            if (mount("tmpfs", NETDIR, "tmpfs", MS_NOSUID | MS_NODEV, opt) != 0)
+                say("could not mount a private tmpfs (%s); using /tmp's tmpfs", strerror(errno));
+            struct statvfs sv;
+            if (statvfs(NETDIR, &sv) == 0) {
+                long long freeb = (long long)sv.f_bavail * (long long)sv.f_frsize;
+                if (freeb < total) {
+                    say("only %lld MB of tmpfs space for a %lld MB image. Plug in a USB stick "
+                        "(it is then used as the cache). Leaving Tizen untouched", freeb / MB, total / MB);
+                    umount(NETDIR);
+                    return 1;
+                }
+            }
+            say("RAM cache: image %lld MB, MemAvailable now %ld MB (more after Tizen apps stop)",
+                total / MB, mem_avail_mb());
+        }
+
         if (O.sha) snprintf(sha_text, sizeof sha_text, "%s", O.sha);
         else {
             char su[2100];
@@ -1497,7 +1542,10 @@ static int run(void)
         if (ram && !O.download_only) { free_ram(); killed = 1; }  /* need the RAM first */
         if (fetch_image(url, dir, sha_text[0] ? sha_text : NULL, ram, image, sizeof image) != 0) {
             if (killed) fail_and_restore("network image unavailable");
-            else if (g_usb_mounted) umount(USBDIR);
+            else {
+                if (ram) umount(NETDIR);
+                if (g_usb_mounted) umount(USBDIR);
+            }
             return 1;
         }
     }
