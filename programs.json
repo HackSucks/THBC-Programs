@@ -110,7 +110,8 @@
                     "sha256": "efbab04924528c5f1895be00f2341f592f4c6b4b01fcf87873e05f04feb0785b",
                     "size": 3348
                 }
-            ]
+            ],
+            "baseUrl": "https://raw.githubusercontent.com/HackSucks/THBC-Programs/main"
         }
     ]
 }
