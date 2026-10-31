@@ -77,6 +77,40 @@
                     "size": 989
                 }
             ]
+        },
+        {
+            "id": "linuxswitch",
+            "name": "LinuxSwitch",
+            "author": "NVMe",
+            "version": "1.0.0",
+            "description": "UnshackleOS root switcher. Mounts unshackle.squashfs from a USB stick or over HTTP and chroots into a Debian userspace alongside Tizen. Nothing persistent is written, so a reboot returns to stock Tizen.",
+            "dir": "linuxswitch",
+            "readme": "README.md",
+            "language": "native",
+            "runtime": "elf",
+            "entry": "LinuxSwitch",
+            "args": [
+                "--menu"
+            ],
+            "terminal": true,
+            "keyboard": true,
+            "icon": "res/icons/linuxswitch.png",
+            "bundled": false,
+            "files": [
+                {
+                    "path": "LinuxSwitch",
+                    "url": "linuxswitch/LinuxSwitch",
+                    "sha256": "7f5df87f843b22fab607d5f3e4de28fb7221b926c4d1cd8d42bfe9dfb405be5f",
+                    "size": 108740,
+                    "executable": true
+                },
+                {
+                    "path": "README.md",
+                    "url": "linuxswitch/README.md",
+                    "sha256": "efbab04924528c5f1895be00f2341f592f4c6b4b01fcf87873e05f04feb0785b",
+                    "size": 3348
+                }
+            ]
         }
     ]
 }
