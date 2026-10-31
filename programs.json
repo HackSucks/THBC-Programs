@@ -100,8 +100,8 @@
                 {
                     "path": "LinuxSwitch",
                     "url": "linuxswitch/LinuxSwitch",
-                    "sha256": "3adf5e531710e4528cd7342f262906c68276f69e800a174b0f6f0a7a82ef6b1e",
-                    "size": 120772,
+                    "sha256": "676d4317fa5b87402c30ed56cb76453a973a8da88d157cf32c2e6c88a6831a33",
+                    "size": 123500,
                     "executable": true
                 },
                 {

@@ -720,15 +720,54 @@ static int mask_devices(void)
     return rc;
 }
 
+/* Is `dev` already mounted (Tizen's automounter does this: /opt/media/USBDriveA1)?
+ * A second mount of the same device with different flags fails with EBUSY, so the
+ * existing mount has to be reused. */
+static int mounted_at(const char *dev, char *mp, size_t mpsz, int *rw)
+{
+    char want[PATH_MAX], have[PATH_MAX];
+    if (!realpath(dev, want)) snprintf(want, sizeof want, "%s", dev);
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return 0;
+    char l[1024];
+    int found = 0;
+    while (!found && fgets(l, sizeof l, f)) {
+        char src[512], tgt[512], type[64], opts[256];
+        if (sscanf(l, "%511s %511s %63s %255s", src, tgt, type, opts) != 4) continue;
+        if (src[0] != '/' || strcmp(type, "vfat")) continue;
+        if (!realpath(src, have)) snprintf(have, sizeof have, "%s", src);
+        if (strcmp(have, want)) continue;
+        snprintf(mp, mpsz, "%s", tgt);
+        *rw = !strncmp(opts, "rw", 2);
+        found = 1;
+    }
+    fclose(f);
+    return found;
+}
+
 static int usb_try(const char *dev)
 {
-    if (mount(dev, USBDIR, "vfat", MS_RDONLY, NULL) != 0) return 0;
+    char mp[512];
+    int rw = 0;
+    g_usb_rw = 0;
+    if (mounted_at(dev, mp, sizeof mp, &rw)) {
+        say("%s is already mounted by Tizen at %s (%s): reusing it", dev, mp, rw ? "rw" : "ro");
+        if (mount(mp, USBDIR, NULL, MS_BIND, NULL) != 0) {
+            say("bind mount %s -> " USBDIR " failed: %s", mp, strerror(errno));
+            return 0;
+        }
+        g_usb_rw = rw;
+    } else if (mount(dev, USBDIR, "vfat", MS_RDONLY, NULL) != 0) {
+        say("mount %s failed: %s", dev, strerror(errno));
+        return 0;
+    }
     if (exists(USBDIR "/" IMGNAME) || exists(USBDIR "/unshackle.url") ||
         exists(USBDIR "/unshackle.conf")) {
         snprintf(g_usb_dev, sizeof g_usb_dev, "%s", dev);
         return 1;
     }
     umount(USBDIR);
+    g_usb_rw = 0;
     return 0;
 }
 
@@ -796,6 +835,8 @@ static int is_keep(const char *base, const char *comm)
 /* Signals processes whose cmdline contains any pattern (pkill -f semantics),
  * but never keep-list processes, PID 1, or ourselves. If force_name != NULL,
  * matches basename exactly and ignores the keep list (used for enlightenment). */
+static long g_est_kb;            /* filled by a dry run (sig == 0) */
+
 static int signal_procs(const char *const *pats, const char *force_name, int sig)
 {
     DIR *d = opendir("/proc");
@@ -829,20 +870,46 @@ static int signal_procs(const char *const *pats, const char *force_name, int sig
             if (is_keep(base, comm)) continue;
             for (int i = 0; pats[i]; i++) if (strstr(cmd, pats[i])) { match = 1; break; }
         }
-        if (match) { kill(pid, sig); hit++; }
+        if (match) {
+            if (sig == 0) {                       /* dry run: count RSS, kill nothing */
+                char sm[64], st[128];
+                long pages = 0, res = 0;
+                snprintf(sm, sizeof sm, "/proc/%d/statm", pid);
+                if (slurp(sm, st, sizeof st) > 0 && sscanf(st, "%ld %ld", &pages, &res) == 2)
+                    g_est_kb += res * (sysconf(_SC_PAGESIZE) / 1024);
+            } else kill(pid, sig);
+            hit++;
+        }
     }
     closedir(d);
     return hit;
 }
 
-static void free_ram(void)
+static int kill_patterns(const char **all)
 {
-    const char *all[48];
     int n = 0;
     for (int i = 0; KILL_BASE[i]; i++) all[n++] = KILL_BASE[i];
     if (O.kill_streaming) for (int i = 0; KILL_STREAM[i]; i++) all[n++] = KILL_STREAM[i];
     for (int i = 0; i < O.n_extra && n < 46; i++) all[n++] = O.extra[i];
     all[n] = NULL;
+    return n;
+}
+
+/* Optimistic MB that free_ram() would hand back (RSS of its victims; shared pages
+ * are counted too, so the real number can be lower). Kills nothing. */
+static long free_ram_estimate_mb(void)
+{
+    const char *all[48];
+    kill_patterns(all);
+    g_est_kb = 0;
+    signal_procs(all, NULL, 0);
+    return g_est_kb / 1024;
+}
+
+static void free_ram(void)
+{
+    const char *all[48];
+    kill_patterns(all);
     int k = signal_procs(all, NULL, SIGTERM);
     say("freeing RAM: signalled %d process(es)", k);
     sleep(2);
@@ -1527,8 +1594,17 @@ static int run(void)
                     return 1;
                 }
             }
-            say("RAM cache: image %lld MB, MemAvailable now %ld MB (more after Tizen apps stop)",
-                total / MB, mem_avail_mb());
+            long now = mem_avail_mb(), back = free_ram_estimate_mb();
+            long need = (long)(total / MB) + O.min_mem;
+            say("RAM cache: image %lld MB + %ld MB reserve = %ld MB needed; free now %ld MB, "
+                "stopping Tizen apps frees ~%ld MB", total / MB, O.min_mem, need, now, back);
+            if (now >= 0 && now + back < need) {
+                say("NOT ENOUGH RAM for a network download (short by ~%ld MB). Options: use a USB stick "
+                    "(then RAM is not needed for the image), or --min-mem N to shrink the reserve "
+                    "(risky), or --kill-streaming. Leaving Tizen untouched", need - (now + back));
+                umount(NETDIR);
+                return 1;
+            }
         }
 
         if (O.sha) snprintf(sha_text, sizeof sha_text, "%s", O.sha);
